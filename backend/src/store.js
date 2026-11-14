@@ -110,7 +110,7 @@ const store = {
     return [...users.values()]
       .filter(user =>
         user.id !== currentUserId &&
-        user.username.includes(query)
+        user.username.startsWith(query)
       )
       .slice(0, 10)
       .map(({ id, fullName, username }) => ({
@@ -154,20 +154,20 @@ const store = {
   },
 
   updateGroup(groupId, { name, description }) {
-   const group = groups.get(groupId);
- 
-   if (!group) {
-     throw new Error("GROUP_NOT_FOUND");
-   }
- 
-   group.name = name;
-   group.description = description;
-   group.updatedAt = new Date().toISOString();
- 
-   groups.set(groupId, group);
-   saveDatabase();
- 
-   return group;
+    const group = groups.get(groupId);
+
+    if (!group) {
+      throw new Error("GROUP_NOT_FOUND");
+    }
+
+    group.name = name;
+    group.description = description;
+    group.updatedAt = new Date().toISOString();
+
+    groups.set(groupId, group);
+    saveDatabase();
+
+    return group;
   },
 
   getMembership(groupId, userId) {
@@ -273,7 +273,7 @@ const store = {
     saveDatabase();
   },
 
-  
+
   // MESSAGES
   addMessage(message) {
     const newMessage = {
