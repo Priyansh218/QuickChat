@@ -57,7 +57,7 @@ router.post("/register", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 12);
 
-    const user = store.createUser({
+    const user = await store.createUser({
       fullName: cleanName,
       username: cleanUsername,
       passwordHash
@@ -75,6 +75,8 @@ router.post("/register", async (req, res) => {
         message: "Username is already taken."
       });
     }
+
+    console.error("Registration error:", error);
 
     return res.status(500).json({
       success: false,
@@ -95,7 +97,7 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    const user = store.getUserByUsername(username.trim());
+    const user = await store.getUserByUsername(username.trim());
 
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       return res.status(401).json({
@@ -116,7 +118,9 @@ router.post("/login", async (req, res) => {
       token,
       user: safeUser(user)
     });
-  } catch {
+  } catch (error) {
+    console.error("Login error:", error);
+
     return res.status(500).json({
       success: false,
       message: "Login failed."
@@ -125,20 +129,29 @@ router.post("/login", async (req, res) => {
 });
 
 // CURRENT USER
-router.get("/me", authenticate, (req, res) => {
-  const user = store.getUserById(req.user.id);
+router.get("/me", authenticate, async (req, res) => {
+  try {
+    const user = await store.getUserById(req.user.id);
 
-  if (!user) {
-    return res.status(404).json({
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found."
+      });
+    }
+
+    return res.json({
+      success: true,
+      user: safeUser(user)
+    });
+  } catch (error) {
+    console.error("Current user error:", error);
+
+    return res.status(500).json({
       success: false,
-      message: "User not found."
+      message: "Could not retrieve user."
     });
   }
-
-  res.json({
-    success: true,
-    user: safeUser(user)
-  });
 });
 
 module.exports = router;

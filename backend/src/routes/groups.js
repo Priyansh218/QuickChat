@@ -5,104 +5,148 @@ const authenticate = require("../middleware/auth");
 
 const router = express.Router();
 
-function isAdmin(groupId, userId) {
-  const membership = store.getMembership(groupId, userId);
-  return membership && membership.role === "admin";
-}
+// GROUP MEMBER MIDDLEWARE
+async function requireGroupMember(req, res, next) {
+  try {
+    const groupId = req.params.groupId;
 
-function requireGroupMember(req, res, next) {
-  const group = store.getGroup(req.params.groupId);
-  const membership = store.getMembership(req.params.groupId, req.user.id);
+    const [group, membership] = await Promise.all([
+      store.getGroup(groupId),
+      store.getMembership(groupId, req.user.id)
+    ]);
 
-  if (!group || !membership) {
-    return res.status(404).json({
-      success: false,
-      message: "Group not found."
-    });
+    if (!group || !membership) {
+      return res.status(404).json({
+        success: false,
+        message: "Group not found."
+      });
+    }
+
+    req.group = group;
+    req.membership = membership;
+
+    next();
+  } catch (error) {
+    next(error);
   }
-
-  req.group = group;
-  req.membership = membership;
-  next();
 }
 
 // CREATE GROUP
-router.post("/", authenticate, (req, res) => {
-  const { name, description = "", memberIds = [] } = req.body;
+router.post("/", authenticate, async (req, res) => {
+  try {
+    const { name, description = "", memberIds = [] } = req.body;
 
-  if (typeof name !== "string" || name.trim().length < 2 || name.trim().length > 50) {
-    return res.status(400).json({
-      success: false,
-      message: "Group name must be between 2 and 50 characters."
-    });
-  }
+    if (
+      typeof name !== "string" ||
+      name.trim().length < 2 ||
+      name.trim().length > 50
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Group name must be between 2 and 50 characters."
+      });
+    }
 
-  if (typeof description !== "string" || description.length > 200) {
-    return res.status(400).json({
-      success: false,
-      message: "Description must be 200 characters or fewer."
-    });
-  }
+    if (typeof description !== "string" || description.length > 200) {
+      return res.status(400).json({
+        success: false,
+        message: "Description must be 200 characters or fewer."
+      });
+    }
 
-  if (!Array.isArray(memberIds) || memberIds.length > 49) {
-    return res.status(400).json({
-      success: false,
-      message: "You can add up to 49 other members."
-    });
-  }
+    if (!Array.isArray(memberIds) || memberIds.length > 49) {
+      return res.status(400).json({
+        success: false,
+        message: "You can add up to 49 other members."
+      });
+    }
 
-  const uniqueIds = [...new Set(memberIds)];
+    const uniqueIds = [...new Set(memberIds)];
 
-  if (uniqueIds.some(id => typeof id !== "string")) {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid member list."
-    });
-  }
+    if (uniqueIds.some(id => typeof id !== "string")) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid member list."
+      });
+    }
 
-  for (const id of uniqueIds) {
-    if (!store.getUserById(id)) {
+    const users = await Promise.all(
+      uniqueIds.map(id => store.getUserById(id))
+    );
+
+    if (users.some(user => !user)) {
       return res.status(400).json({
         success: false,
         message: "One or more selected users do not exist."
       });
     }
+
+    const group = await store.createGroup({
+      name: name.trim(),
+      description: description.trim(),
+      creatorId: req.user.id,
+      memberIds: uniqueIds
+    });
+
+    const members = await store.getGroupMembers(group.id);
+
+    return res.status(201).json({
+      success: true,
+      message: "Group created successfully.",
+      group,
+      members
+    });
+  } catch (error) {
+    console.error("Create group error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not create group."
+    });
   }
-
-  const group = store.createGroup({
-    name: name.trim(),
-    description: description.trim(),
-    creatorId: req.user.id,
-    memberIds: uniqueIds
-  });
-
-  res.status(201).json({
-    success: true,
-    message: "Group created successfully.",
-    group,
-    members: store.getGroupMembers(group.id)
-  });
 });
 
 // LIST MY GROUPS
-router.get("/", authenticate, (req, res) => {
-  res.json({
-    success: true,
-    groups: store.getUserGroups(req.user.id)
-  });
+router.get("/", authenticate, async (req, res) => {
+  try {
+    const groups = await store.getUserGroups(req.user.id);
+
+    return res.json({
+      success: true,
+      groups
+    });
+  } catch (error) {
+    console.error("List groups error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not retrieve groups."
+    });
+  }
 });
 
 // GROUP DETAILS
-router.get("/:groupId", authenticate, requireGroupMember, (req, res) => {
-  res.json({
-    success: true,
-    group: req.group,
-    members: store.getGroupMembers(req.params.groupId)
-  });
+router.get("/:groupId", authenticate, requireGroupMember, async (req, res) => {
+  try {
+    const members = await store.getGroupMembers(req.params.groupId);
+
+    return res.json({
+      success: true,
+      group: req.group,
+      members
+    });
+  } catch (error) {
+    console.error("Group details error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not retrieve group details."
+    });
+  }
 });
 
 // UPDATE GROUP DETAILS (ADMIN ONLY)
-router.patch("/:groupId", authenticate, requireGroupMember, (req, res) => {
+router.patch("/:groupId", authenticate, requireGroupMember, async (req, res) => {
   if (req.membership.role !== "admin") {
     return res.status(403).json({
       success: false,
@@ -134,7 +178,7 @@ router.patch("/:groupId", authenticate, requireGroupMember, (req, res) => {
   }
 
   try {
-    const updatedGroup = store.updateGroup(req.params.groupId, {
+    const updatedGroup = await store.updateGroup(req.params.groupId, {
       name: name.trim(),
       description: description.trim()
     });
@@ -145,6 +189,8 @@ router.patch("/:groupId", authenticate, requireGroupMember, (req, res) => {
       group: updatedGroup
     });
   } catch (error) {
+    console.error("Update group error:", error);
+
     return res.status(500).json({
       success: false,
       message: "Could not update group details."
@@ -153,36 +199,36 @@ router.patch("/:groupId", authenticate, requireGroupMember, (req, res) => {
 });
 
 // ADD MEMBER (ADMIN ONLY)
-router.post("/:groupId/members", authenticate, requireGroupMember, (req, res) => {
-  if (!isAdmin(req.params.groupId, req.user.id)) {
+router.post("/:groupId/members", authenticate, requireGroupMember, async (req, res) => {
+  if (req.membership.role !== "admin") {
     return res.status(403).json({
       success: false,
       message: "Only the group admin can add members."
     });
   }
 
-  const { username } = req.body;
-
-  if (typeof username !== "string" || !username.trim()) {
-    return res.status(400).json({
-      success: false,
-      message: "Username is required."
-    });
-  }
-
-  const user = store.getUserByUsername(username.trim());
-
-  if (!user) {
-    return res.status(404).json({
-      success: false,
-      message: "User not found."
-    });
-  }
-
   try {
-    store.addMember(req.params.groupId, user.id);
+    const { username } = req.body;
 
-    res.status(201).json({
+    if (typeof username !== "string" || !username.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Username is required."
+      });
+    }
+
+    const user = await store.getUserByUsername(username.trim());
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found."
+      });
+    }
+
+    await store.addMember(req.params.groupId, user.id);
+
+    return res.status(201).json({
       success: true,
       message: "Member added successfully."
     });
@@ -194,7 +240,9 @@ router.post("/:groupId/members", authenticate, requireGroupMember, (req, res) =>
       });
     }
 
-    res.status(500).json({
+    console.error("Add member error:", error);
+
+    return res.status(500).json({
       success: false,
       message: "Could not add member."
     });
@@ -202,8 +250,8 @@ router.post("/:groupId/members", authenticate, requireGroupMember, (req, res) =>
 });
 
 // REMOVE MEMBER (ADMIN ONLY)
-router.delete("/:groupId/members/:userId", authenticate, requireGroupMember, (req, res) => {
-  if (!isAdmin(req.params.groupId, req.user.id)) {
+router.delete("/:groupId/members/:userId", authenticate, requireGroupMember, async (req, res) => {
+  if (req.membership.role !== "admin") {
     return res.status(403).json({
       success: false,
       message: "Only the group admin can remove members."
@@ -217,28 +265,37 @@ router.delete("/:groupId/members/:userId", authenticate, requireGroupMember, (re
     });
   }
 
-  const membership = store.getMembership(
-    req.params.groupId,
-    req.params.userId
-  );
+  try {
+    const membership = await store.getMembership(
+      req.params.groupId,
+      req.params.userId
+    );
 
-  if (!membership) {
-    return res.status(404).json({
+    if (!membership) {
+      return res.status(404).json({
+        success: false,
+        message: "Member not found."
+      });
+    }
+
+    await store.removeMember(req.params.groupId, req.params.userId);
+
+    return res.json({
+      success: true,
+      message: "Member removed successfully."
+    });
+  } catch (error) {
+    console.error("Remove member error:", error);
+
+    return res.status(500).json({
       success: false,
-      message: "Member not found."
+      message: "Could not remove member."
     });
   }
-
-  store.removeMember(req.params.groupId, req.params.userId);
-
-  res.json({
-    success: true,
-    message: "Member removed successfully."
-  });
 });
 
-// TRANSFER ADMIN (CURRENT ADMIN ONLY)
-router.patch("/:groupId/admin", authenticate, requireGroupMember, (req, res) => {
+// TRANSFER ADMIN
+router.patch("/:groupId/admin", authenticate, requireGroupMember, async (req, res) => {
   if (req.membership.role !== "admin") {
     return res.status(403).json({
       success: false,
@@ -256,7 +313,7 @@ router.patch("/:groupId/admin", authenticate, requireGroupMember, (req, res) => 
   }
 
   try {
-    store.transferAdmin(
+    await store.transferAdmin(
       req.params.groupId,
       req.user.id,
       newAdminId
@@ -274,6 +331,8 @@ router.patch("/:groupId/admin", authenticate, requireGroupMember, (req, res) => 
       });
     }
 
+    console.error("Transfer admin error:", error);
+
     return res.status(400).json({
       success: false,
       message: "Could not transfer admin rights."
@@ -282,7 +341,7 @@ router.patch("/:groupId/admin", authenticate, requireGroupMember, (req, res) => 
 });
 
 // LEAVE GROUP (NON-ADMIN)
-router.post("/:groupId/leave", authenticate, requireGroupMember, (req, res) => {
+router.post("/:groupId/leave", authenticate, requireGroupMember, async (req, res) => {
   if (req.membership.role === "admin") {
     return res.status(400).json({
       success: false,
@@ -290,29 +349,47 @@ router.post("/:groupId/leave", authenticate, requireGroupMember, (req, res) => {
     });
   }
 
-  store.removeMember(req.params.groupId, req.user.id);
+  try {
+    await store.removeMember(req.params.groupId, req.user.id);
 
-  res.json({
-    success: true,
-    message: "You left the group."
-  });
+    return res.json({
+      success: true,
+      message: "You left the group."
+    });
+  } catch (error) {
+    console.error("Leave group error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not leave group."
+    });
+  }
 });
 
 // DELETE GROUP (ADMIN ONLY)
-router.delete("/:groupId", authenticate, requireGroupMember, (req, res) => {
-  if (!isAdmin(req.params.groupId, req.user.id)) {
+router.delete("/:groupId", authenticate, requireGroupMember, async (req, res) => {
+  if (req.membership.role !== "admin") {
     return res.status(403).json({
       success: false,
       message: "Only the group admin can delete the group."
     });
   }
 
-  store.deleteGroup(req.params.groupId);
+  try {
+    await store.deleteGroup(req.params.groupId);
 
-  res.json({
-    success: true,
-    message: "Group deleted successfully."
-  });
+    return res.json({
+      success: true,
+      message: "Group deleted successfully."
+    });
+  } catch (error) {
+    console.error("Delete group error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Could not delete group."
+    });
+  }
 });
 
 module.exports = router;

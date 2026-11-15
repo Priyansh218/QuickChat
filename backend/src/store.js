@@ -1,184 +1,258 @@
 
 const { v4: uuid } = require("uuid");
-const fs = require("fs");
-const path = require("path");
 
-// Persistent database location: backend/data/db.json
-const DATA_DIR = path.join(__dirname, "..", "data");
-const DB_FILE = path.join(DATA_DIR, "db.json");
+const {
+  GetCommand,
+  PutCommand,
+  QueryCommand,
+  UpdateCommand,
+  DeleteCommand,
+  TransactWriteCommand,
+  BatchWriteCommand
+} = require("@aws-sdk/lib-dynamodb");
 
-const users = new Map();
-const groups = new Map();
-const memberships = new Map();
-const messages = new Map();
+const dynamodb = require("./dynamodb");
 
-const usernameKey = (username) => username.toLowerCase();
+const USERS = "QuickChatUsers";
+const GROUPS = "QuickChatGroups";
+const MEMBERSHIPS = "QuickChatMemberships";
+const MESSAGES = "QuickChatMessages";
 
-// Save all collections to the JSON file
-function saveDatabase() {
-  const data = {
-    users: [...users.values()],
-    groups: [...groups.values()],
-    memberships: [...memberships.values()],
-    messages: Object.fromEntries(messages)
-  };
+const usernameKey = username => username.trim().toLowerCase();
 
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+function mapUser(item) {
+  if (!item) return null;
 
-  const tempFile = `${DB_FILE}.tmp`;
-
-  fs.writeFileSync(
-    tempFile,
-    JSON.stringify(data, null, 2),
-    "utf8"
-  );
-
-  fs.renameSync(tempFile, DB_FILE);
+  const { userID, ...rest } = item;
+  return { ...rest, id: userID };
 }
 
-// Load existing data when the backend starts
-function loadDatabase() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+function mapGroup(item) {
+  if (!item) return null;
 
-  if (!fs.existsSync(DB_FILE)) {
-    saveDatabase();
-    return;
-  }
-
-  const rawData = fs.readFileSync(DB_FILE, "utf8");
-  const data = JSON.parse(rawData);
-
-  for (const user of data.users || []) {
-    users.set(usernameKey(user.username), user);
-  }
-
-  for (const group of data.groups || []) {
-    groups.set(group.id, group);
-  }
-
-  for (const membership of data.memberships || []) {
-    memberships.set(
-      `${membership.groupId}:${membership.userId}`,
-      membership
-    );
-  }
-
-  for (const [groupId, groupMessages] of Object.entries(
-    data.messages || {}
-  )) {
-    messages.set(groupId, groupMessages);
-  }
+  const { groupId, ...rest } = item;
+  return { ...rest, id: groupId };
 }
 
-// Initialize storage before the routes use it
-loadDatabase();
+function mapMessage(item) {
+  if (!item) return null;
+
+  const { messageId, ...rest } = item;
+  return { ...rest, id: messageId };
+}
+
+async function queryAll(params) {
+  const items = [];
+  let ExclusiveStartKey;
+
+  do {
+    const result = await dynamodb.send(new QueryCommand({
+      ...params,
+      ...(ExclusiveStartKey ? { ExclusiveStartKey } : {})
+    }));
+
+    items.push(...(result.Items || []));
+    ExclusiveStartKey = result.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+
+  return items;
+}
+
+async function batchDelete(table, items, keyNames) {
+  for (let i = 0; i < items.length; i += 25) {
+    let pending = items.slice(i, i + 25).map(item => ({
+      DeleteRequest: {
+        Key: Object.fromEntries(
+          keyNames.map(key => [key, item[key]])
+        )
+      }
+    }));
+
+    let attempts = 0;
+
+    while (pending.length && attempts < 5) {
+      const result = await dynamodb.send(new BatchWriteCommand({
+        RequestItems: { [table]: pending }
+      }));
+
+      pending = result.UnprocessedItems?.[table] || [];
+      attempts++;
+    }
+
+    if (pending.length) {
+      throw new Error("BATCH_DELETE_INCOMPLETE");
+    }
+  }
+}
 
 const store = {
   // USERS
-  createUser(user) {
-    const key = usernameKey(user.username);
 
-    if (users.has(key)) {
-      throw new Error("USERNAME_EXISTS");
-    }
-
+  async createUser(user) {
     const newUser = {
-      id: uuid(),
+      userID: uuid(),
       fullName: user.fullName,
-      username: key,
+      username: usernameKey(user.username),
+      userType: "USER",
       passwordHash: user.passwordHash,
       createdAt: new Date().toISOString()
     };
 
-    users.set(key, newUser);
-    saveDatabase();
+    try {
+      await dynamodb.send(new PutCommand({
+        TableName: USERS,
+        Item: newUser,
+        ConditionExpression: "attribute_not_exists(username)"
+      }));
+    } catch (error) {
+      if (error.name === "ConditionalCheckFailedException") {
+        throw new Error("USERNAME_EXISTS");
+      }
+      throw error;
+    }
 
-    return newUser;
+    return mapUser(newUser);
   },
 
-  getUserByUsername(username) {
-    return users.get(usernameKey(username)) || null;
+  async getUserByUsername(username) {
+    const result = await dynamodb.send(new GetCommand({
+      TableName: USERS,
+      Key: { username: usernameKey(username) }
+    }));
+
+    return mapUser(result.Item);
   },
 
-  getUserById(id) {
-    return [...users.values()].find(user => user.id === id) || null;
+  async getUserById(id) {
+    const result = await dynamodb.send(new QueryCommand({
+      TableName: USERS,
+      IndexName: "userId-index",
+      KeyConditionExpression: "userID = :id",
+      ExpressionAttributeValues: { ":id": id },
+      Limit: 1
+    }));
+
+    return mapUser(result.Items?.[0]);
   },
 
-  searchUsers(username, currentUserId) {
-    const query = usernameKey(username);
+  async searchUsers(username, currentUserId) {
+    const prefix = usernameKey(username);
 
-    return [...users.values()]
-      .filter(user =>
-        user.id !== currentUserId &&
-        user.username.startsWith(query)
-      )
+    const result = await dynamodb.send(new QueryCommand({
+      TableName: USERS,
+      IndexName: "username-prefix-index",
+      KeyConditionExpression:
+        "userType = :type AND begins_with(username, :prefix)",
+      ExpressionAttributeValues: {
+        ":type": "USER",
+        ":prefix": prefix
+      },
+      Limit: 50
+    }));
+
+    return (result.Items || [])
+      .filter(user => user.userID !== currentUserId)
       .slice(0, 10)
-      .map(({ id, fullName, username }) => ({
-        id, fullName, username
+      .map(user => ({
+        id: user.userID,
+        fullName: user.fullName,
+        username: user.username
       }));
   },
 
   // GROUPS
-  createGroup({ name, description, creatorId, memberIds }) {
+
+  async createGroup({ name, description, creatorId, memberIds }) {
     const groupId = uuid();
     const now = new Date().toISOString();
 
     const group = {
-      id: groupId,
+      groupId,
       name,
       description: description || "",
       createdBy: creatorId,
       createdAt: now
     };
 
-    groups.set(groupId, group);
-
     const allMembers = [...new Set([creatorId, ...memberIds])];
 
-    allMembers.forEach(userId => {
-      memberships.set(`${groupId}:${userId}`, {
-        groupId,
-        userId,
-        role: userId === creatorId ? "admin" : "member",
-        joinedAt: now
-      });
+    const transactItems = [
+      {
+        Put: {
+          TableName: GROUPS,
+          Item: group,
+          ConditionExpression: "attribute_not_exists(groupId)"
+        }
+      },
+      ...allMembers.map(userId => ({
+        Put: {
+          TableName: MEMBERSHIPS,
+          Item: {
+            groupId,
+            userId,
+            role: userId === creatorId ? "admin" : "member",
+            joinedAt: now
+          },
+          ConditionExpression:
+            "attribute_not_exists(groupId) AND attribute_not_exists(userId)"
+        }
+      }))
+    ];
+
+    await dynamodb.send(new TransactWriteCommand({
+      TransactItems: transactItems
+    }));
+
+    return mapGroup(group);
+  },
+
+  async getGroup(groupId) {
+    const result = await dynamodb.send(new GetCommand({
+      TableName: GROUPS,
+      Key: { groupId }
+    }));
+
+    return mapGroup(result.Item);
+  },
+
+  async updateGroup(groupId, { name, description }) {
+    const result = await dynamodb.send(new UpdateCommand({
+      TableName: GROUPS,
+      Key: { groupId },
+      UpdateExpression:
+        "SET #name = :name, description = :description, updatedAt = :updatedAt",
+      ExpressionAttributeNames: { "#name": "name" },
+      ExpressionAttributeValues: {
+        ":name": name,
+        ":description": description,
+        ":updatedAt": new Date().toISOString()
+      },
+      ConditionExpression: "attribute_exists(groupId)",
+      ReturnValues: "ALL_NEW"
+    }));
+
+    return mapGroup(result.Attributes);
+  },
+
+  async getMembership(groupId, userId) {
+    const result = await dynamodb.send(new GetCommand({
+      TableName: MEMBERSHIPS,
+      Key: { groupId, userId }
+    }));
+
+    return result.Item || null;
+  },
+
+  async getGroupMembers(groupId) {
+    const memberships = await queryAll({
+      TableName: MEMBERSHIPS,
+      KeyConditionExpression: "groupId = :groupId",
+      ExpressionAttributeValues: { ":groupId": groupId }
     });
 
-    saveDatabase();
-
-    return group;
-  },
-
-  getGroup(groupId) {
-    return groups.get(groupId) || null;
-  },
-
-  updateGroup(groupId, { name, description }) {
-    const group = groups.get(groupId);
-
-    if (!group) {
-      throw new Error("GROUP_NOT_FOUND");
-    }
-
-    group.name = name;
-    group.description = description;
-    group.updatedAt = new Date().toISOString();
-
-    groups.set(groupId, group);
-    saveDatabase();
-
-    return group;
-  },
-
-  getMembership(groupId, userId) {
-    return memberships.get(`${groupId}:${userId}`) || null;
-  },
-
-  getGroupMembers(groupId) {
-    return [...memberships.values()]
-      .filter(item => item.groupId === groupId)
-      .map(item => {
-        const user = this.getUserById(item.userId);
+    const members = await Promise.all(
+      memberships.map(async item => {
+        const user = await this.getUserById(item.userId);
 
         return user ? {
           id: user.id,
@@ -188,55 +262,72 @@ const store = {
           joinedAt: item.joinedAt
         } : null;
       })
-      .filter(Boolean);
+    );
+
+    return members.filter(Boolean);
   },
 
-  getUserGroups(userId) {
-    return [...memberships.values()]
-      .filter(item => item.userId === userId)
-      .map(item => {
-        const group = groups.get(item.groupId);
+  async getUserGroups(userId) {
+    const memberships = await queryAll({
+      TableName: MEMBERSHIPS,
+      IndexName: "userId-index",
+      KeyConditionExpression: "userId = :userId",
+      ExpressionAttributeValues: { ":userId": userId }
+    });
 
+    const groups = await Promise.all(
+      memberships.map(async item => {
+        const group = await this.getGroup(item.groupId);
         if (!group) return null;
+
+        const members = await this.getGroupMembers(group.id);
 
         return {
           ...group,
           role: item.role,
-          memberCount: this.getGroupMembers(group.id).length
+          memberCount: members.length
         };
       })
-      .filter(Boolean);
+    );
+
+    return groups.filter(Boolean);
   },
 
-  addMember(groupId, userId) {
-    const key = `${groupId}:${userId}`;
+  async addMember(groupId, userId) {
+    try {
+      await dynamodb.send(new PutCommand({
+        TableName: MEMBERSHIPS,
+        Item: {
+          groupId,
+          userId,
+          role: "member",
+          joinedAt: new Date().toISOString()
+        },
+        ConditionExpression:
+          "attribute_not_exists(groupId) AND attribute_not_exists(userId)"
+      }));
+    } catch (error) {
+      if (error.name === "ConditionalCheckFailedException") {
+        throw new Error("ALREADY_MEMBER");
+      }
+      throw error;
+    }
+  },
 
-    if (memberships.has(key)) {
-      throw new Error("ALREADY_MEMBER");
+  async removeMember(groupId, userId) {
+    await dynamodb.send(new DeleteCommand({
+      TableName: MEMBERSHIPS,
+      Key: { groupId, userId }
+    }));
+  },
+
+  async transferAdmin(groupId, currentAdminId, newAdminId) {
+    if (currentAdminId === newAdminId) {
+      throw new Error("SAME_ADMIN");
     }
 
-    memberships.set(key, {
-      groupId,
-      userId,
-      role: "member",
-      joinedAt: new Date().toISOString()
-    });
-
-    saveDatabase();
-  },
-
-  removeMember(groupId, userId) {
-    memberships.delete(`${groupId}:${userId}`);
-    saveDatabase();
-  },
-
-  // TRANSFER ADMIN
-  transferAdmin(groupId, currentAdminId, newAdminId) {
-    const currentAdminKey = `${groupId}:${currentAdminId}`;
-    const newAdminKey = `${groupId}:${newAdminId}`;
-
-    const currentAdmin = memberships.get(currentAdminKey);
-    const newAdmin = memberships.get(newAdminKey);
+    const currentAdmin = await this.getMembership(groupId, currentAdminId);
+    const newAdmin = await this.getMembership(groupId, newAdminId);
 
     if (!currentAdmin || currentAdmin.role !== "admin") {
       throw new Error("NOT_CURRENT_ADMIN");
@@ -246,85 +337,118 @@ const store = {
       throw new Error("TARGET_NOT_MEMBER");
     }
 
-    if (currentAdminId === newAdminId) {
-      throw new Error("SAME_ADMIN");
-    }
-
-    currentAdmin.role = "member";
-    newAdmin.role = "admin";
-
-    memberships.set(currentAdminKey, currentAdmin);
-    memberships.set(newAdminKey, newAdmin);
-
-    saveDatabase();
+    await dynamodb.send(new TransactWriteCommand({
+      TransactItems: [
+        {
+          Update: {
+            TableName: MEMBERSHIPS,
+            Key: { groupId, userId: currentAdminId },
+            UpdateExpression: "SET #role = :member",
+            ExpressionAttributeNames: { "#role": "role" },
+            ExpressionAttributeValues: { ":member": "member" },
+            ConditionExpression: "#role = :admin"
+          }
+        },
+        {
+          Update: {
+            TableName: MEMBERSHIPS,
+            Key: { groupId, userId: newAdminId },
+            UpdateExpression: "SET #role = :admin",
+            ExpressionAttributeNames: { "#role": "role" },
+            ExpressionAttributeValues: { ":admin": "admin" },
+            ConditionExpression: "attribute_exists(groupId)"
+          }
+        }
+      ]
+    }));
   },
 
-  deleteGroup(groupId) {
-    groups.delete(groupId);
+  async deleteGroup(groupId) {
+    const [memberships, messages] = await Promise.all([
+      queryAll({
+        TableName: MEMBERSHIPS,
+        KeyConditionExpression: "groupId = :groupId",
+        ExpressionAttributeValues: { ":groupId": groupId }
+      }),
+      queryAll({
+        TableName: MESSAGES,
+        KeyConditionExpression: "groupId = :groupId",
+        ExpressionAttributeValues: { ":groupId": groupId }
+      })
+    ]);
 
-    for (const [key, membership] of memberships) {
-      if (membership.groupId === groupId) {
-        memberships.delete(key);
-      }
-    }
+    await batchDelete(
+      MEMBERSHIPS,
+      memberships,
+      ["groupId", "userId"]
+    );
 
-    messages.delete(groupId);
+    await batchDelete(
+      MESSAGES,
+      messages,
+      ["groupId", "messageId"]
+    );
 
-    saveDatabase();
+    await dynamodb.send(new DeleteCommand({
+      TableName: GROUPS,
+      Key: { groupId }
+    }));
   },
-
 
   // MESSAGES
-  addMessage(message) {
+
+  async addMessage(message) {
     const newMessage = {
-      id: uuid(),
-      ...message,
+      groupId: message.groupId,
+      messageId: uuid(),
+      senderId: message.senderId,
+      senderName: message.senderName,
+      text: message.text,
       createdAt: new Date().toISOString()
     };
 
-    const groupMessages = messages.get(message.groupId) || [];
+    await dynamodb.send(new PutCommand({
+      TableName: MESSAGES,
+      Item: newMessage
+    }));
 
-    groupMessages.push(newMessage);
-    messages.set(message.groupId, groupMessages);
-
-    saveDatabase();
-
-    return newMessage;
+    return mapMessage(newMessage);
   },
 
-  getMessages(groupId, limit = 50, before) {
-    let result = messages.get(groupId) || [];
+  async getMessages(groupId, limit = 50, before) {
+    const result = await dynamodb.send(new QueryCommand({
+      TableName: MESSAGES,
+      IndexName: "groupId-createdAt-index",
+      KeyConditionExpression: before
+        ? "groupId = :groupId AND createdAt < :before"
+        : "groupId = :groupId",
+      ExpressionAttributeValues: before
+        ? { ":groupId": groupId, ":before": before }
+        : { ":groupId": groupId },
+      ScanIndexForward: false,
+      Limit: limit
+    }));
 
-    if (before) {
-      result = result.filter(
-        message => message.createdAt < before
-      );
-    }
-
-    return result.slice(-limit);
+    return (result.Items || []).reverse().map(mapMessage);
   },
 
-  getMessage(groupId, messageId) {
-    const groupMessages = messages.get(groupId) || [];
+  async getMessage(groupId, messageId) {
+    const result = await dynamodb.send(new GetCommand({
+      TableName: MESSAGES,
+      Key: { groupId, messageId }
+    }));
 
-    return groupMessages.find(
-      message => message.id === messageId
-    ) || null;
+    return mapMessage(result.Item);
   },
 
-  deleteMessage(groupId, messageId) {
-    const groupMessages = messages.get(groupId) || [];
+  async deleteMessage(groupId, messageId) {
+    const existing = await this.getMessage(groupId, messageId);
+    if (!existing) return false;
 
-    const updatedMessages = groupMessages.filter(
-      message => message.id !== messageId
-    );
-
-    if (updatedMessages.length === groupMessages.length) {
-      return false;
-    }
-
-    messages.set(groupId, updatedMessages);
-    saveDatabase();
+    await dynamodb.send(new DeleteCommand({
+      TableName: MESSAGES,
+      Key: { groupId, messageId }
+    }));
 
     return true;
   }
