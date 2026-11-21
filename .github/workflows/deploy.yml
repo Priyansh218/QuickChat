@@ -1,0 +1,123 @@
+name: QuickChat CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: "22"
+  AWS_REGION: us-east-1
+  S3_BUCKET: quickchat-frontend
+  VITE_API_URL: http://54.197.142.222/api
+  APP_DIR: /home/ec2-user/QuickChat/backend
+
+jobs:
+  backend-check:
+    name: Backend checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check all backend source files
+        run: find src -name "*.js" -print -exec node --check {} \;
+
+      - name: Dependency vulnerability audit (informational)
+        run: npm audit --omit=dev --audit-level=high
+        continue-on-error: true
+
+  frontend-build:
+    name: Frontend lint and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (informational)
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Production build
+        run: npm run build
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to EC2 and S3
+    needs: [backend-check, frontend-build]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+
+      - name: Prepare SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2.pem
+          chmod 600 ~/.ssh/ec2.pem
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy backend to EC2
+        run: |
+          tar czf backend.tgz -C backend src package.json package-lock.json
+          scp -i ~/.ssh/ec2.pem backend.tgz "$EC2_USER@$EC2_HOST:/tmp/backend.tgz"
+          ssh -i ~/.ssh/ec2.pem "$EC2_USER@$EC2_HOST" "
+            set -e
+            cd $APP_DIR
+            tar xzf /tmp/backend.tgz
+            npm ci --omit=dev
+            sudo systemctl restart quickchat
+            sleep 4
+            curl -fsS http://127.0.0.1:4000/api/health
+          "
+
+      - name: Deploy frontend to S3 (using the instance IAM role)
+        run: |
+          tar czf dist.tgz -C dist .
+          scp -i ~/.ssh/ec2.pem dist.tgz "$EC2_USER@$EC2_HOST:/tmp/dist.tgz"
+          ssh -i ~/.ssh/ec2.pem "$EC2_USER@$EC2_HOST" "
+            set -e
+            rm -rf /tmp/dist && mkdir /tmp/dist
+            tar xzf /tmp/dist.tgz -C /tmp/dist
+            aws s3 sync /tmp/dist s3://$S3_BUCKET --delete --region $AWS_REGION
+          "
