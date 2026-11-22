@@ -14,7 +14,7 @@ const messageRoutes = require("./routes/messages");
 const app = express();
 
 // Running behind Nginx, so trust the first proxy hop for the real client IP
-app.set("trust proxy", 1);
+app.set("trust proxy", 2);
 
 app.use(cors({
   origin: process.env.FRONTEND_URL || "http://localhost:5173"
