@@ -11,7 +11,7 @@ env:
   NODE_VERSION: "22"
   AWS_REGION: us-east-1
   S3_BUCKET: quickchat-frontend
-  VITE_API_URL: http://54.197.142.222/api
+  VITE_API_URL: http://quickchat-alb-780174188.us-east-1.elb.amazonaws.com/api
   APP_DIR: /home/ec2-user/QuickChat/backend
 
 jobs:
