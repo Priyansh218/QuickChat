@@ -345,7 +345,7 @@ const store = {
             Key: { groupId, userId: currentAdminId },
             UpdateExpression: "SET #role = :member",
             ExpressionAttributeNames: { "#role": "role" },
-            ExpressionAttributeValues: { ":member": "member" },
+            ExpressionAttributeValues: { ":member": "member", ":admin": "admin" },
             ConditionExpression: "#role = :admin"
           }
         },
